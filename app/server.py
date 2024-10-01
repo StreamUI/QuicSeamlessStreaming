@@ -17,7 +17,6 @@ from seamless_communication.streaming.agents.seamless_streaming_s2st import Seam
 
 # Constants and Logger Setup
 SAMPLE_RATE = 16000
-BYTES_PER_SAMPLE = 2
 # TGT_LANG = "spa"
 TGT_LANG = "eng"
 logging.basicConfig(level=logging.DEBUG)
@@ -81,11 +80,21 @@ class Transcoder:
         self.states = self.agent.build_states()
         self.lock = asyncio.Lock()
 
-        # Separate queues for different processing stages
-        self.raw_input_queue = asyncio.Queue()
+        # Audio buffer to hold raw audio data
+        self.audio_buffer = bytearray()
+        self.end_stream = False
+
+        # Queues for different stages of processing
         self.preprocessed_queue = asyncio.Queue()
         self.output_queue = asyncio.Queue()
-        self.end_stream = False
+
+    def add_to_buffer(self, audio_data: bytes):
+        """Add incoming audio data to the buffer."""
+        self.audio_buffer.extend(audio_data)
+
+    def mark_end_of_stream(self):
+        """Mark the stream as ended."""
+        self.end_stream = True
 
     async def run(self):
         """Main transcoder loop to process incoming audio."""
@@ -97,35 +106,45 @@ class Transcoder:
         await asyncio.gather(*tasks)
 
     async def ingest_audio(self):
-        """Handle raw audio input."""
-        while not self.end_stream or not self.raw_input_queue.empty():
-            try:
-                audio_bytes, end_stream = await asyncio.wait_for(self.raw_input_queue.get(), timeout=1.0)
-                # logger.info("[ingest_audio] Got input")
-                self.raw_input_queue.task_done()
-                # Preprocess audio bytes into SpeechSegment
-                audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        """Handle raw audio input, chunking and queuing for processing."""
+        CHUNK_SIZE = 1024 * 8  # Set a chunk size, e.g., 8192 bytes
+
+        while not self.end_stream or len(self.audio_buffer) > 0:
+            # If there's data in the buffer and it exceeds CHUNK_SIZE, process it
+            while len(self.audio_buffer) >= CHUNK_SIZE:
+                audio_chunk = self.audio_buffer[:CHUNK_SIZE]
+                self.audio_buffer = self.audio_buffer[CHUNK_SIZE:]
+
+                # Convert the audio chunk into a SpeechSegment
+                audio_np = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
                 input_segment = SpeechSegment(
                     content=audio_np,
                     sample_rate=self.sample_rate,
                     tgt_lang=TGT_LANG,
-                    finished=end_stream,
+                    finished=False,
                 )
                 await self.preprocessed_queue.put(input_segment)
-                if end_stream:
-                    logger.info("[ingest_audio] End of stream received")
-                    self.end_stream = True
-            except asyncio.TimeoutError:
-                if self.end_stream and self.raw_input_queue.empty():
-                    logger.info("[ingest_audio] No more input, ending ingest_audio.")
-                    break
+
+            # Flush remaining buffer if stream has ended
+            if self.end_stream and len(self.audio_buffer) > 0:
+                audio_np = np.frombuffer(self.audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+                input_segment = SpeechSegment(
+                    content=audio_np,
+                    sample_rate=self.sample_rate,
+                    tgt_lang=TGT_LANG,
+                    finished=True,
+                )
+                await self.preprocessed_queue.put(input_segment)
+                self.audio_buffer = bytearray()  # Clear the buffer
+                break
+
+            await asyncio.sleep(0.01)
 
     async def process_audio(self):
         """Process preprocessed audio segments."""
         while not self.end_stream or not self.preprocessed_queue.empty():
             try:
                 input_segment = await asyncio.wait_for(self.preprocessed_queue.get(), timeout=1.0)
-                # logger.info("[process_audio] Processing input segment")
                 self.preprocessed_queue.task_done()
                 async with self.lock:
                     with torch.no_grad():
@@ -133,8 +152,6 @@ class Transcoder:
                             None, self.agent.pushpop, input_segment, self.states
                         )
                 output_segments = OutputSegments(output)
-                # logger.info("[process_audio] Processed audio segments: %d, is empty: %s",
-                #              len(output_segments.segments), output_segments.is_empty)
                 if not output_segments.is_empty:
                     await self.output_queue.put(output_segments)
                 if output_segments.finished:
@@ -167,7 +184,6 @@ class QuicStreamingAudioServerProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stream_id = None
-        self.audio_buffer = bytearray()
         self.end_of_stream = False
         self.transcoder_task = None
         self.sender_task = None
@@ -194,18 +210,12 @@ class QuicStreamingAudioServerProtocol(QuicConnectionProtocol):
     def handle_stream_data(self, event: StreamDataReceived):
         """Processes incoming stream data."""
         self.stream_id = event.stream_id
-        self.audio_buffer.extend(event.data)
-
-        # Process complete audio chunks
-        remainder = len(self.audio_buffer) % BYTES_PER_SAMPLE
-        audio_bytes = self.audio_buffer[:-remainder] if remainder else self.audio_buffer
-        logger.info(f"Audio buffer length after extending: {len(audio_bytes)}, remainder: {remainder}")
-        self.audio_buffer = self.audio_buffer[-remainder:] if remainder else bytearray()
-        asyncio.create_task(self.transcoder.raw_input_queue.put((audio_bytes, self.end_of_stream)))
+        self.transcoder.add_to_buffer(event.data)  # Add audio data to transcoder's buffer
 
     def handle_connection_terminated(self):
         """Handle connection termination and clean up."""
         logger.info(f"Connection terminated")
+        self.transcoder.mark_end_of_stream()  # Mark the stream as ended
         self.cancel_tasks()
 
     async def send_output(self):
@@ -229,9 +239,6 @@ class QuicStreamingAudioServerProtocol(QuicConnectionProtocol):
                         self.transmit()
                     elif isinstance(segment, TextSegment):
                         logger.info(f"[send_output] Got text segment: {segment.content}")
-                    else:
-                        pass
-                        # logger.info("[send_output] Not a speech segment")
                 self.transcoder.output_queue.task_done()
 
         except asyncio.CancelledError:
